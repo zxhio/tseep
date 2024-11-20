@@ -107,6 +107,13 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	// MakeFileHeaderFn generates a custom file header for specific formats,
+	// such as pcap files. The function should return a byte slice containing
+	// the file header data and any potential error encountered during header
+	// generation. The default behavior is to generate no header unless
+	// explicitly defined.
+	MakeFileHeaderFn func() ([]byte, error) `json:"makeFileHeader" yaml:"makeFileHeader"`
+
 	size int64
 	file *os.File
 	mu   sync.Mutex
@@ -154,6 +161,18 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
+	}
+
+	if l.size == 0 && l.MakeFileHeaderFn != nil {
+		h, err := l.MakeFileHeaderFn()
+		if err != nil {
+			return 0, err
+		}
+		n, err = l.file.Write(h)
+		if err != nil {
+			return 0, err
+		}
+		l.size += int64(n)
 	}
 
 	n, err = l.file.Write(p)
