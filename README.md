@@ -76,5 +76,4 @@ This command writes captured traffic directly to a TUN device, which can be used
     - host options *--host* *--dst-host* *--src-host*
     - port options *--port* *--dst-port* *--src-port*
     - tcp flags *--tcp-flags* which value is *syn* *psh* *ack* *fin* etc.
-2. **dump** command *--file* option support pcap rotation.
-3. **serve** command support **dump** subcommand.
+2. **serve** command support **dump** subcommand.

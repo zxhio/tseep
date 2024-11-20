@@ -7,6 +7,7 @@ replace github.com/natefinch/lumberjack => ./pkg/lumberjack-2.2.1
 
 require (
 	github.com/google/gopacket v1.1.19
+	github.com/natefinch/lumberjack v0.0.0-00010101000000-000000000000
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8

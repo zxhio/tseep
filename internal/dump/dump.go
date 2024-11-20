@@ -16,6 +16,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
+	"github.com/natefinch/lumberjack"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/songgao/water"
@@ -85,6 +86,58 @@ func (d *FileWriter) Write(data []byte) (int, error) {
 func (d *FileWriter) Close() error {
 	if d.file != nil {
 		return d.file.Close()
+	}
+	return nil
+}
+
+type RotateFileWriter struct {
+	l      *lumberjack.Logger
+	buffer *bytes.Buffer
+	pcapw  *pcapgo.Writer
+}
+
+func NewRotateFileWriter(filename string, maxFileSize, maxFileBackups, maxAge int, compress bool) (*RotateFileWriter, error) {
+	b := bytes.NewBuffer(make([]byte, 0, 1024*64))
+	return &RotateFileWriter{
+		l: &lumberjack.Logger{
+			Filename:   filename,
+			MaxSize:    maxFileSize,
+			MaxBackups: maxFileBackups,
+			MaxAge:     maxAge,
+			Compress:   compress,
+			MakeFileHeaderFn: func() ([]byte, error) {
+				var hb bytes.Buffer
+				w := pcapgo.NewWriter(&hb)
+				w.WriteFileHeader(0, layers.LinkTypeEthernet)
+				return hb.Bytes(), nil
+			},
+		},
+		buffer: b,
+		pcapw:  pcapgo.NewWriter(b),
+	}, nil
+}
+
+func (d *RotateFileWriter) Type() string { return "rotate-file" }
+
+func (d *RotateFileWriter) Write(data []byte) (int, error) {
+	d.buffer.Reset()
+
+	err := d.pcapw.WritePacket(gopacket.CaptureInfo{
+		Timestamp:      time.Now(),
+		Length:         len(data),
+		CaptureLength:  len(data),
+		InterfaceIndex: 0, // TODO: add interface
+	}, data)
+	if err != nil {
+		return 0, errors.Wrap(err, "pcapgo.WritePacket")
+	}
+
+	return d.l.Write(d.buffer.Bytes())
+}
+
+func (d *RotateFileWriter) Close() error {
+	if d.l != nil {
+		return d.l.Close()
 	}
 	return nil
 }

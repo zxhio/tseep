@@ -18,6 +18,8 @@ var cmd = &cobra.Command{
 		iface, _ := cmd.Flags().GetString("iface")
 		tcp, _ := cmd.Flags().GetString("tcp")
 		file, _ := cmd.Flags().GetString("file")
+		maxFileSize, _ := cmd.Flags().GetInt("file-max-size")
+		maxFileBackups, _ := cmd.Flags().GetInt("file-max-backups")
 		tun, _ := cmd.Flags().GetString("tun")
 		noStdout, _ := cmd.Flags().GetBool("no-stdout")
 		verbose, _ := cmd.Flags().GetBool("verbose")
@@ -42,11 +44,19 @@ var cmd = &cobra.Command{
 		}
 
 		if file != "" {
-			fileW, err := NewFileWriter(file)
+			var (
+				w   DumpWriter
+				err error
+			)
+			if maxFileSize != 0 || maxFileBackups != 0 {
+				w, err = NewRotateFileWriter(file, maxFileSize, maxFileBackups, 0, false)
+			} else {
+				w, err = NewFileWriter(file)
+			}
 			if err != nil {
 				return err
 			}
-			writerlist = append(writerlist, fileW)
+			writerlist = append(writerlist, w)
 		}
 
 		if tun != "" {
@@ -84,6 +94,8 @@ var cmd = &cobra.Command{
 func init() {
 	cmd.Flags().StringP("iface", "i", "", "network interface to capture from")
 	cmd.Flags().StringP("file", "w", "", "save captured packets to a local file")
+	cmd.Flags().IntP("file-max-size", "", 0, "Maximum size for pcap files (in MB)")
+	cmd.Flags().IntP("file-max-backups", "", 0, "Number of backup files to retain")
 	cmd.Flags().String("tcp", "", "send captured packets to a remote server via TCP")
 	cmd.Flags().String("tun", "", "write captured packets to a TUN device")
 	cmd.Flags().Bool("no-stdout", false, "disable writing to stdout")
