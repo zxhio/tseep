@@ -2,6 +2,9 @@ module tseep
 
 go 1.21.10
 
+// Fix millCh goroutine leak with pr https://github.com/natefinch/lumberjack/pull/80
+replace github.com/natefinch/lumberjack => ./pkg/lumberjack-2.2.1
+
 require (
 	github.com/google/gopacket v1.1.19
 	github.com/pkg/errors v0.9.1
