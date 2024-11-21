@@ -219,8 +219,9 @@ func (*StdoutWriter) Type() string { return "stdout" }
 
 func (w *StdoutWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) (int, error) {
 	var (
-		b     strings.Builder
-		delim packet.FormatDelimiter
+		parent gopacket.Layer
+		b      strings.Builder
+		delim  packet.FormatDelimiter
 	)
 
 	p := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
@@ -232,7 +233,7 @@ func (w *StdoutWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) (int, e
 
 		f, ok := packet.GetLayerFormatter(layer.LayerType())
 		if ok {
-			s, d = f.Format(layer, w.opts...)
+			s, d = f.Format(layer, append(w.opts, packet.WithFormatParentLayer(parent))...)
 		} else if layer.LayerType() != gopacket.LayerTypePayload {
 			s = layer.LayerType().String()
 			d = packet.FormatDelimiterComma
@@ -243,6 +244,7 @@ func (w *StdoutWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) (int, e
 		b.WriteString(string(delim))
 		b.WriteString(s)
 		delim = d
+		parent = layer
 	}
 
 	fmt.Printf("%s %s\n", packet.FormatDumpTime(ci.Timestamp), b.String())
@@ -286,11 +288,11 @@ func (w *TunWriter) Write(data []byte) (int, error) {
 	)
 
 	p := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
-	for k, layer := range p.Layers() {
+	for _, layer := range p.Layers() {
 		if layer.LayerType() == layers.LayerTypeIPv4 || layer.LayerType() == layers.LayerTypeIPv6 {
 			ethernet = underlay
 		}
-		underlay = p.Layers()[k]
+		underlay = layer
 	}
 	if ethernet == nil {
 		return 0, nil

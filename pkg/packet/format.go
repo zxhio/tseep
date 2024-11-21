@@ -13,12 +13,17 @@ import (
 
 type formatOpts struct {
 	showEthernet bool
+	parentLayer  gopacket.Layer
 }
 
 type FormatOpt func(*formatOpts)
 
 func WithFormatEthernet() FormatOpt {
 	return func(o *formatOpts) { o.showEthernet = true }
+}
+
+func WithFormatParentLayer(parent gopacket.Layer) FormatOpt {
+	return func(o *formatOpts) { o.parentLayer = parent }
 }
 
 type FormatDelimiter string
@@ -79,7 +84,9 @@ func (LayerFormatterEthernet) Format(layer gopacket.Layer, opts ...FormatOpt) (s
 			eth.SrcMAC, eth.DstMAC, eth.EthernetType, int(eth.EthernetType), len(eth.Contents)+len(eth.Payload)), FormatDelimiterColon
 	}
 
-	if eth.EthernetType == layers.EthernetTypeIPv4 || eth.EthernetType == layers.EthernetTypeIPv6 {
+	if eth.EthernetType == layers.EthernetTypeIPv4 ||
+		eth.EthernetType == layers.EthernetTypeIPv6 ||
+		eth.EthernetType == layers.EthernetTypeARP {
 		return eth.EthernetType.String(), FormatDelimiterSpace
 	}
 
@@ -128,12 +135,17 @@ func (LayerFormatterARP) Format(layer gopacket.Layer, opts ...FormatOpt) (string
 }
 
 // 172.17.0.1 > 172.17.0.10
+// 172.17.0.1.80 > 172.17.0.10.35912
 type LayerFormatterIPv4 struct{}
 
 func (LayerFormatterIPv4) LayerType() gopacket.LayerType { return layers.LayerTypeIPv4 }
 
 func (LayerFormatterIPv4) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
 	ipv4 := layer.(*layers.IPv4)
+	if ipv4.NextLayerType() == layers.LayerTypeTCP || ipv4.NextLayerType() == layers.LayerTypeUDP {
+		// format in next layer with port
+		return "", FormatDelimiterNone
+	}
 	return fmt.Sprintf("%s > %s", ipv4.SrcIP, ipv4.DstIP), FormatDelimiterColon
 }
 
@@ -144,6 +156,10 @@ func (LayerFormatterIPv6) LayerType() gopacket.LayerType { return layers.LayerTy
 
 func (LayerFormatterIPv6) Format(layer gopacket.Layer, _ ...FormatOpt) (string, FormatDelimiter) {
 	ipv6 := layer.(*layers.IPv6)
+	if ipv6.NextLayerType() == layers.LayerTypeTCP || ipv6.NextLayerType() == layers.LayerTypeUDP {
+		// format in next layer with port
+		return "", FormatDelimiterNone
+	}
 	return fmt.Sprintf("%s > %s", ipv6.SrcIP, ipv6.DstIP), FormatDelimiterColon
 }
 
@@ -180,10 +196,27 @@ func (LayerFormatterUDP) LayerType() gopacket.LayerType { return layers.LayerTyp
 
 func (LayerFormatterUDP) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
 	udp := layer.(*layers.UDP)
-	if udp.NextLayerType() == gopacket.LayerTypePayload {
-		return fmt.Sprintf("UDP, length %d", len(udp.Payload)), FormatDelimiterNone
+	if udp.NextLayerType() != gopacket.LayerTypePayload {
+		return "", FormatDelimiterNone
 	}
-	return "", FormatDelimiterNone
+
+	var o formatOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	b := strings.Builder{}
+	if o.parentLayer != nil {
+		if o.parentLayer.LayerType() == layers.LayerTypeIPv4 {
+			ipv4 := o.parentLayer.(*layers.IPv4)
+			b.WriteString(fmt.Sprintf("%s.%d > %s.%d: ", ipv4.SrcIP, udp.SrcPort, ipv4.DstIP, udp.DstPort))
+		} else if o.parentLayer.LayerType() == layers.LayerTypeIPv6 {
+			ipv6 := o.parentLayer.(*layers.IPv6)
+			b.WriteString(fmt.Sprintf("%s.%d > %s.%d: ", ipv6.SrcIP, udp.SrcPort, ipv6.DstIP, udp.DstPort))
+		}
+	}
+	b.WriteString(fmt.Sprintf("UDP, length %d", len(udp.Payload)))
+	return b.String(), FormatDelimiterNone
 }
 
 // VXLAN, flags [I] (0x08), vni 20000
@@ -229,9 +262,24 @@ type LayerFormatterTCP struct{}
 func (LayerFormatterTCP) LayerType() gopacket.LayerType { return layers.LayerTypeTCP }
 
 func (f LayerFormatterTCP) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	var o formatOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	tcp := layer.(*layers.TCP)
 
 	b := strings.Builder{}
+	if o.parentLayer != nil {
+		if o.parentLayer.LayerType() == layers.LayerTypeIPv4 {
+			ipv4 := o.parentLayer.(*layers.IPv4)
+			b.WriteString(fmt.Sprintf("%s.%d > %s.%d: ", ipv4.SrcIP, tcp.SrcPort, ipv4.DstIP, tcp.DstPort))
+		} else if o.parentLayer.LayerType() == layers.LayerTypeIPv6 {
+			ipv6 := o.parentLayer.(*layers.IPv6)
+			b.WriteString(fmt.Sprintf("%s.%d > %s.%d: ", ipv6.SrcIP, tcp.SrcPort, ipv6.DstIP, tcp.DstPort))
+		}
+	}
+
 	b.WriteString(fmt.Sprintf("Flags [%s]", f.formatFlags(tcp)))
 
 	if tcp.SYN {
