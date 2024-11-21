@@ -280,7 +280,23 @@ func (w *TunWriter) WritePacket(_ gopacket.CaptureInfo, data []byte) (int, error
 }
 
 func (w *TunWriter) Write(data []byte) (int, error) {
-	return w.tun.Write(data[14:])
+	var (
+		ethernet gopacket.Layer
+		underlay gopacket.Layer
+	)
+
+	p := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
+	for k, layer := range p.Layers() {
+		if layer.LayerType() == layers.LayerTypeIPv4 || layer.LayerType() == layers.LayerTypeIPv6 {
+			ethernet = underlay
+		}
+		underlay = p.Layers()[k]
+	}
+	if ethernet == nil {
+		return 0, nil
+	}
+
+	return w.tun.Write(ethernet.LayerPayload())
 }
 
 func (w *TunWriter) Close() error {
