@@ -1,12 +1,10 @@
 package dump
 
 import (
-	"context"
-	"errors"
-
 	"tseep/internal/command"
-	"tseep/pkg/capture"
 
+	"github.com/gopacket/gopacket/afpacket"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -16,12 +14,13 @@ var cmd = &cobra.Command{
 	Short: "Dump capture TCP/IP packet",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		iface, _ := cmd.Flags().GetString("iface")
-		tcp, _ := cmd.Flags().GetString("tcp")
 		file, _ := cmd.Flags().GetString("file")
 		maxFileSize, _ := cmd.Flags().GetInt("file-max-size")
 		maxFileBackups, _ := cmd.Flags().GetInt("file-max-backups")
-		tun, _ := cmd.Flags().GetString("tun")
+		tcp, _ := cmd.Flags().GetString("to-tcp")
+		tun, _ := cmd.Flags().GetString("to-tun")
 		noStdout, _ := cmd.Flags().GetBool("no-stdout")
+		showEthernet, _ := cmd.Flags().GetBool("stdout-ethernet")
 		verbose, _ := cmd.Flags().GetBool("verbose")
 
 		if iface == "" {
@@ -68,37 +67,43 @@ var cmd = &cobra.Command{
 		}
 
 		if !noStdout {
-			writerlist = append(writerlist, StdoutWriter{})
+			writerlist = append(writerlist, NewStdoutWriter(showEthernet))
 		}
 
-		capture, err := capture.NewCaptureByIfaceName(iface)
+		tpacket, err := afpacket.NewTPacket(afpacket.OptInterface(iface), afpacket.OptAddVLANHeader(true))
 		if err != nil {
 			return err
 		}
 
-		go func() {
-			for data := range capture.Read() {
-				for _, w := range writerlist {
-					_, err := w.Write(data)
-					if err != nil {
-						logrus.WithField("type", w.Type()).WithError(err).Warn("Fail to write")
-						continue
-					}
+		for {
+			data, ci, err := tpacket.ReadPacketData()
+			if err != nil {
+				return errors.Wrap(err, "afpacket.ReadPacketData")
+			}
+			if ci.Length < ci.CaptureLength {
+				ci.Length = ci.CaptureLength
+			}
+
+			for _, w := range writerlist {
+				_, err := w.WritePacket(ci, data)
+				if err != nil {
+					logrus.WithField("type", w.Type()).WithError(err).Warn("Fail to write")
+					continue
 				}
 			}
-		}()
-		return capture.Serve(context.Background())
+		}
 	},
 }
 
 func init() {
 	cmd.Flags().StringP("iface", "i", "", "network interface to capture from")
 	cmd.Flags().StringP("file", "w", "", "save captured packets to a local file")
-	cmd.Flags().IntP("file-max-size", "", 0, "Maximum size for pcap files (in MB)")
-	cmd.Flags().IntP("file-max-backups", "", 0, "Number of backup files to retain")
-	cmd.Flags().String("tcp", "", "send captured packets to a remote server via TCP")
-	cmd.Flags().String("tun", "", "write captured packets to a TUN device")
+	cmd.Flags().IntP("file-max-size", "", 0, "maximum size for pcap files (in MB)")
+	cmd.Flags().IntP("file-max-backups", "", 0, "number of backup files to retain")
+	cmd.Flags().String("to-tcp", "", "send captured packets to a remote server via TCP")
+	cmd.Flags().String("to-tun", "", "write captured packets to a TUN device")
 	cmd.Flags().Bool("no-stdout", false, "disable writing to stdout")
+	cmd.Flags().BoolP("stdout-ethernet", "e", false, "stdout display ethernet info")
 	cmd.Flags().BoolP("verbose", "v", false, "enable verbose capture output")
 	command.Register(cmd)
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,9 +14,9 @@ import (
 	"tseep/pkg/tlv"
 	"tseep/pkg/utils"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 	"github.com/natefinch/lumberjack"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -24,6 +25,7 @@ import (
 
 type DumpWriter interface {
 	Type() string
+	WritePacket(gopacket.CaptureInfo, []byte) (int, error)
 	io.WriteCloser
 }
 
@@ -65,33 +67,36 @@ func NewFileWriter(filename string) (*FileWriter, error) {
 	}, nil
 }
 
-func (d *FileWriter) Type() string { return "file" }
+func (w *FileWriter) Type() string { return "file" }
 
-func (d *FileWriter) Write(data []byte) (int, error) {
-	d.buffer.Reset()
-
-	err := d.pcapw.WritePacket(gopacket.CaptureInfo{
-		Timestamp:      time.Now(),
-		Length:         len(data),
-		CaptureLength:  len(data),
-		InterfaceIndex: 0, // TODO: add interface
-	}, data)
+func (w *FileWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) (int, error) {
+	w.buffer.Reset()
+	err := w.pcapw.WritePacket(ci, data)
 	if err != nil {
 		return 0, errors.Wrap(err, "pcapgo.WritePacket")
 	}
-
-	return d.file.Write(d.buffer.Bytes())
+	return w.file.Write(w.buffer.Bytes())
 }
 
-func (d *FileWriter) Close() error {
-	if d.file != nil {
-		return d.file.Close()
+func (w *FileWriter) Write(data []byte) (int, error) {
+	ci := gopacket.CaptureInfo{
+		Timestamp:      time.Now(),
+		Length:         len(data),
+		CaptureLength:  len(data),
+		InterfaceIndex: 0,
+	}
+	return w.WritePacket(ci, data)
+}
+
+func (w *FileWriter) Close() error {
+	if w.file != nil {
+		return w.file.Close()
 	}
 	return nil
 }
 
 type RotateFileWriter struct {
-	l      *lumberjack.Logger
+	logger *lumberjack.Logger
 	buffer *bytes.Buffer
 	pcapw  *pcapgo.Writer
 }
@@ -99,7 +104,7 @@ type RotateFileWriter struct {
 func NewRotateFileWriter(filename string, maxFileSize, maxFileBackups, maxAge int, compress bool) (*RotateFileWriter, error) {
 	b := bytes.NewBuffer(make([]byte, 0, 1024*64))
 	return &RotateFileWriter{
-		l: &lumberjack.Logger{
+		logger: &lumberjack.Logger{
 			Filename:   filename,
 			MaxSize:    maxFileSize,
 			MaxBackups: maxFileBackups,
@@ -117,27 +122,30 @@ func NewRotateFileWriter(filename string, maxFileSize, maxFileBackups, maxAge in
 	}, nil
 }
 
-func (d *RotateFileWriter) Type() string { return "rotate-file" }
+func (w *RotateFileWriter) Type() string { return "rotate-file" }
 
-func (d *RotateFileWriter) Write(data []byte) (int, error) {
-	d.buffer.Reset()
-
-	err := d.pcapw.WritePacket(gopacket.CaptureInfo{
-		Timestamp:      time.Now(),
-		Length:         len(data),
-		CaptureLength:  len(data),
-		InterfaceIndex: 0, // TODO: add interface
-	}, data)
+func (w *RotateFileWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) (int, error) {
+	w.buffer.Reset()
+	err := w.pcapw.WritePacket(ci, data)
 	if err != nil {
 		return 0, errors.Wrap(err, "pcapgo.WritePacket")
 	}
-
-	return d.l.Write(d.buffer.Bytes())
+	return w.logger.Write(w.buffer.Bytes())
 }
 
-func (d *RotateFileWriter) Close() error {
-	if d.l != nil {
-		return d.l.Close()
+func (w *RotateFileWriter) Write(data []byte) (int, error) {
+	ci := gopacket.CaptureInfo{
+		Timestamp:      time.Now(),
+		Length:         len(data),
+		CaptureLength:  len(data),
+		InterfaceIndex: 0,
+	}
+	return w.WritePacket(ci, data)
+}
+
+func (w *RotateFileWriter) Close() error {
+	if w.logger != nil {
+		return w.logger.Close()
 	}
 	return nil
 }
@@ -173,46 +181,79 @@ func NewTCPWriter(addr string) (*TCPWriter, error) {
 	}, nil
 }
 
-func (d *TCPWriter) Type() string { return "tcp" }
+func (w *TCPWriter) Type() string { return "tcp" }
 
-func (d *TCPWriter) Write(data []byte) (int, error) {
-	d.onceTxLoop.Do(func() { go d.tx.Serve(context.Background()) })
+func (w *TCPWriter) WritePacket(_ gopacket.CaptureInfo, data []byte) (int, error) {
+	return w.Write(data)
+}
+
+func (w *TCPWriter) Write(data []byte) (int, error) {
+	w.onceTxLoop.Do(func() { go w.tx.Serve(context.Background()) })
 
 	t := tlv.TLV{Type: 1, Length: uint16(len(data))}
-	d.buffer.Reset()
-	_, err := t.EncodeTo(d.buffer, data)
+	w.buffer.Reset()
+	_, err := t.EncodeTo(w.buffer, data)
 	if err != nil {
 		return 0, errors.Wrap(err, "tlv.EncodeTo")
 	}
-	return d.tx.Write(d.buffer.Bytes())
+	return w.tx.Write(w.buffer.Bytes())
 }
 
-func (d *TCPWriter) Close() error {
-	return d.tx.Close()
+func (w *TCPWriter) Close() error {
+	return w.tx.Close()
 }
 
-type StdoutWriter struct{}
+type StdoutWriter struct {
+	opts []packet.FormatOpt
+}
 
-func (StdoutWriter) Type() string { return "stdout" }
-
-func (StdoutWriter) Write(data []byte) (int, error) {
-	var formatErr error
-	d := packet.NewLayersDecoder(packet.WithCompletedHook(func(dl []packet.DecodingLayer) {
-		var d []byte
-		d, formatErr = packet.Format(dl)
-		if formatErr != nil {
-			return
-		}
-		fmt.Fprintf(os.Stdout, "%s %s\n", FormatDumpTime(time.Now()), string(d))
-	}))
-	err := d.Decode(data, nil)
-	if err != nil {
-		return 0, errors.Wrap(err, "packet.Decode")
+func NewStdoutWriter(showEthernet bool) *StdoutWriter {
+	w := &StdoutWriter{}
+	if showEthernet {
+		w.opts = append(w.opts, packet.WithFormatEthernet())
 	}
-	return 0, errors.Wrap(err, "packet.Format")
+	return w
 }
 
-func (StdoutWriter) Close() error { return nil }
+func (*StdoutWriter) Type() string { return "stdout" }
+
+func (w *StdoutWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) (int, error) {
+	var (
+		b     strings.Builder
+		delim packet.FormatDelimiter
+	)
+
+	p := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
+	for _, layer := range p.Layers() {
+		var (
+			s string
+			d packet.FormatDelimiter
+		)
+
+		f, ok := packet.GetLayerFormatter(layer.LayerType())
+		if ok {
+			s, d = f.Format(layer, w.opts...)
+		} else if layer.LayerType() != gopacket.LayerTypePayload {
+			s = layer.LayerType().String()
+			d = packet.FormatDelimiterComma
+		} else {
+			continue
+		}
+
+		b.WriteString(string(delim))
+		b.WriteString(s)
+		delim = d
+	}
+
+	fmt.Printf("%s %s\n", packet.FormatDumpTime(ci.Timestamp), b.String())
+	return 0, nil
+}
+
+func (w *StdoutWriter) Write(data []byte) (int, error) {
+	return w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, data)
+}
+
+func (*StdoutWriter) Close() error { return nil }
 
 type TunWriter struct {
 	tun *water.Interface
@@ -232,19 +273,19 @@ func NewTunWriter(tunName string) (*TunWriter, error) {
 	return &TunWriter{tun: ifaceTun}, nil
 }
 
-func (t *TunWriter) Type() string { return "tun" }
+func (w *TunWriter) Type() string { return "tun" }
 
-func (t *TunWriter) Write(data []byte) (int, error) {
-	return t.tun.Write(data[14:])
+func (w *TunWriter) WritePacket(_ gopacket.CaptureInfo, data []byte) (int, error) {
+	return w.Write(data)
 }
 
-func (t *TunWriter) Close() error {
-	if t.tun != nil {
-		return t.tun.Close()
+func (w *TunWriter) Write(data []byte) (int, error) {
+	return w.tun.Write(data[14:])
+}
+
+func (w *TunWriter) Close() error {
+	if w.tun != nil {
+		return w.tun.Close()
 	}
 	return nil
-}
-
-func FormatDumpTime(t time.Time) string {
-	return t.Local().Format("15:04:05.000")
 }

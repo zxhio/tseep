@@ -1,155 +1,324 @@
 package packet
 
 import (
-	"bytes"
+	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
+	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
-type Formatter interface {
-	Format([]DecodingLayer) ([]byte, error)
+type formatOpts struct {
+	showEthernet bool
 }
 
-func Format(layerList []DecodingLayer) ([]byte, error) {
-	f := formatter{}
-	err := f.format(layerList)
-	if err != nil {
-		return nil, err
+type FormatOpt func(*formatOpts)
+
+func WithFormatEthernet() FormatOpt {
+	return func(o *formatOpts) { o.showEthernet = true }
+}
+
+type FormatDelimiter string
+
+const (
+	FormatDelimiterNone    FormatDelimiter = ""
+	FormatDelimiterSpace   FormatDelimiter = " "
+	FormatDelimiterComma   FormatDelimiter = ", "
+	FormatDelimiterColon   FormatDelimiter = ": "
+	FormatDelimiterNewline FormatDelimiter = "\n"
+)
+
+type LayerFormatter interface {
+	LayerType() gopacket.LayerType
+	Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter)
+}
+
+var formatters map[gopacket.LayerType]LayerFormatter
+
+func init() {
+	formatters = make(map[gopacket.LayerType]LayerFormatter)
+
+	Register(LayerFormatterEthernet{})
+	Register(LayerFormatterVLAN{})
+	Register(LayerFormatterARP{})
+	Register(LayerFormatterIPv4{})
+	Register(LayerFormatterIPv6{})
+	Register(LayerFormatterICMPv4{})
+	Register(LayerFormatterUDP{})
+	Register(LayerFormatterTCP{})
+	Register(LayerFormatterVXLAN{})
+}
+
+func Register(layer LayerFormatter) {
+	formatters[layer.LayerType()] = layer
+}
+
+func GetLayerFormatter(layerType gopacket.LayerType) (LayerFormatter, bool) {
+	formatter, ok := formatters[layerType]
+	return formatter, ok
+}
+
+// 02:42:6d:09:05:c4 > 02:42:ac:11:00:0a, ethertype IPv4 (0x0800), length 98:
+type LayerFormatterEthernet struct{}
+
+func (LayerFormatterEthernet) LayerType() gopacket.LayerType { return layers.LayerTypeEthernet }
+
+func (LayerFormatterEthernet) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	var o formatOpts
+	for _, opt := range opts {
+		opt(&o)
 	}
-	return f.Bytes(), nil
-}
 
-// like tcpdump
-type formatter struct {
-	vxlanDepth int
-	bytes.Buffer
-}
+	eth := layer.(*layers.Ethernet)
 
-func (f *formatter) format(layerList []DecodingLayer) error {
-	if len(layerList) == 0 {
-		return nil
+	if o.showEthernet {
+		return fmt.Sprintf("%s > %s, ethertype %s (0x%04x), length %d",
+			eth.SrcMAC, eth.DstMAC, eth.EthernetType, int(eth.EthernetType), len(eth.Contents)+len(eth.Payload)), FormatDelimiterColon
 	}
 
-	eth, ok := layerList[0].(*layers.Ethernet)
-	if !ok {
-		return fmt.Errorf("1st layer is not ethernet")
+	if eth.EthernetType == layers.EthernetTypeIPv4 || eth.EthernetType == layers.EthernetTypeIPv6 {
+		return eth.EthernetType.String(), FormatDelimiterSpace
 	}
-	f.formatEthernet(eth)
 
-	var (
-		layer     DecodingLayer
-		layerType gopacket.LayerType
-	)
+	// not show anything
+	return "", FormatDelimiterNone
+}
 
-	layerType = eth.NextLayerType()
-	for i := 1; i < len(layerList); i++ {
-		layer = layerList[i]
-		err := f.formatLayer(layerList[i-1], layerType, layer)
-		if err != nil {
-			return err
-		}
-		layerType = layer.NextLayerType()
+// vlan 32, p 0, ethertype IPv4 (0x0800)
+type LayerFormatterVLAN struct{}
+
+func (LayerFormatterVLAN) LayerType() gopacket.LayerType { return layers.LayerTypeDot1Q }
+
+func (LayerFormatterVLAN) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	var o formatOpts
+	for _, opt := range opts {
+		opt(&o)
 	}
-	return nil
-}
 
-func (f *formatter) formatLayer(underLayer DecodingLayer, layerType gopacket.LayerType, layer DecodingLayer) error {
-	switch layerType {
-	case layers.LayerTypeEthernet:
-		f.formatEthernet(layer.(*layers.Ethernet))
-	case layers.LayerTypeARP:
-		f.formatARP(layer.(*layers.ARP))
-	case layers.LayerTypeDot1Q:
-		f.formatVLAN(layer.(*layers.Dot1Q))
-	case layers.LayerTypeIPv4:
-		f.formatIPv4(layer.(*layers.IPv4))
-	case layers.LayerTypeTCP:
-		ipv4, ok := underLayer.(*layers.IPv4)
-		if !ok {
-			return fmt.Errorf("the underlying layer of TCP is not IPv4")
-		}
-		f.formatTCP(ipv4, layer.(*layers.TCP))
-	case layers.LayerTypeICMPv4:
-		ipv4, ok := underLayer.(*layers.IPv4)
-		if !ok {
-			return fmt.Errorf("the underlying layer of TCP is not IPv4")
-		}
-		f.formatICMP(ipv4, layer.(*layers.ICMPv4))
-	case layers.LayerTypeUDP:
-		ipv4, ok := underLayer.(*layers.IPv4)
-		if !ok {
-			return fmt.Errorf("the underlying layer of TCP is not IPv4")
-		}
-		f.formatUDP(ipv4, layer.(*layers.UDP))
-	case layers.LayerTypeVXLAN:
-		f.formatVXLAN(layer.(*layers.VXLAN))
+	vlan := layer.(*layers.Dot1Q)
+	if o.showEthernet {
+		return fmt.Sprintf("vlan %d, p %d, ethertype %s (0x%04x)",
+			vlan.VLANIdentifier, vlan.Priority, vlan.Type, int(vlan.Type)), FormatDelimiterComma
 	}
-	return nil
+	return vlan.Type.String(), FormatDelimiterSpace
 }
 
-func (f *formatter) formatEthernet(layer *layers.Ethernet) {
-	f.WriteString(fmt.Sprintf("%s > %s, ethertype %s (0x%04x), length %d",
-		layer.SrcMAC, layer.DstMAC, layer.EthernetType, int(layer.EthernetType), len(layer.Contents)+len(layer.Payload)))
-}
+// Request who-has 172.17.0.1 tell 172.17.0.10, length 28
+// Reply 172.17.0.1 is-at 02:42:6d:09:05:c4, length 28
+type LayerFormatterARP struct{}
 
-func (f *formatter) formatARP(layer *layers.ARP) {
-	f.WriteString(": ARP, ")
-	if layer.Operation == layers.ARPRequest {
-		f.WriteString(fmt.Sprintf("Request who-has %s tell %s", net.IP(layer.DstProtAddress), net.IP(layer.SourceProtAddress)))
-	} else if layer.Operation == layers.ARPReply {
-		f.WriteString(fmt.Sprintf("Reply %s is-at %s", net.IP(layer.DstProtAddress), net.HardwareAddr(layer.DstHwAddress)))
-	}
-	f.WriteString(fmt.Sprintf(", length %d", len(layer.Payload)+len(layer.Contents)))
-}
+func (LayerFormatterARP) LayerType() gopacket.LayerType { return layers.LayerTypeARP }
 
-func (f *formatter) formatVLAN(layer *layers.Dot1Q) {
-	f.WriteString(fmt.Sprintf(": vlan %d ethertype %s (0x%04x)", layer.VLANIdentifier, layer.Type, int(layer.Type)))
-}
-
-func (f *formatter) formatIPv4(layer *layers.IPv4) {}
-
-func (f *formatter) formatTCP(ipv4 *layers.IPv4, tcp *layers.TCP) {
-	f.WriteString(fmt.Sprintf(", %s.%d > %s.%d: Flags [%s], length %d",
-		ipv4.SrcIP, tcp.SrcPort, ipv4.DstIP, tcp.DstPort, stringifyTCPFlags(tcp), len(tcp.Payload)))
-}
-
-func (f *formatter) formatICMP(ipv4 *layers.IPv4, icmp *layers.ICMPv4) {
-	f.WriteString(fmt.Sprintf(", %s > %s: ICMP %s, id %d, req %d, length %d",
-		ipv4.SrcIP, ipv4.DstIP, icmp.TypeCode, icmp.Id, icmp.Seq, len(icmp.Contents)+len(icmp.Payload)))
-}
-
-func (f *formatter) formatUDP(ipv4 *layers.IPv4, udp *layers.UDP) {
-	f.WriteString(fmt.Sprintf(", %s.%d > %s.%d", ipv4.SrcIP, udp.SrcPort, ipv4.DstIP, udp.DstPort))
-	if udp.NextLayerType() == gopacket.LayerTypePayload {
-		f.WriteString(fmt.Sprintf(": UDP, length %d", len(udp.Payload)))
-	}
-}
-
-func (f *formatter) formatVXLAN(layer *layers.VXLAN) {
-	f.WriteString(fmt.Sprintf(": VXLAN, vni %d\n", layer.VNI))
-	f.vxlanDepth++
-	for i := 0; i < f.vxlanDepth; i++ {
-		f.WriteByte(' ')
-	}
-	f.WriteString("└ ")
-}
-
-func stringifyTCPFlags(layer *layers.TCP) string {
+func (LayerFormatterARP) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	arp := layer.(*layers.ARP)
 	var s string
-	if layer.SYN {
-		s = "S"
-	} else if layer.PSH {
-		s = "P"
-	} else if layer.FIN {
-		s = "F"
-	} else if layer.RST {
-		s = "R"
+	if arp.Operation == layers.ARPRequest {
+		s = fmt.Sprintf("Request who-has %s tell %s, length %d",
+			net.IP(arp.DstProtAddress), net.IP(arp.SourceProtAddress), len(arp.Payload)+len(arp.Contents))
+	} else if arp.Operation == layers.ARPReply {
+		s = fmt.Sprintf("Reply %s is-at %s, length %d",
+			net.IP(arp.DstProtAddress), net.HardwareAddr(arp.DstHwAddress), len(arp.Payload)+len(arp.Contents))
+	} else {
+		s = fmt.Sprintf("unknown arp operation %d", arp.Operation)
 	}
-	if layer.ACK {
-		s += "."
+	return s, FormatDelimiterNone
+}
+
+// 172.17.0.1 > 172.17.0.10
+type LayerFormatterIPv4 struct{}
+
+func (LayerFormatterIPv4) LayerType() gopacket.LayerType { return layers.LayerTypeIPv4 }
+
+func (LayerFormatterIPv4) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	ipv4 := layer.(*layers.IPv4)
+	return fmt.Sprintf("%s > %s", ipv4.SrcIP, ipv4.DstIP), FormatDelimiterColon
+}
+
+// fe80::782:bca7:c7d3:c551.59807 > ff02::1:3.5355
+type LayerFormatterIPv6 struct{}
+
+func (LayerFormatterIPv6) LayerType() gopacket.LayerType { return layers.LayerTypeIPv6 }
+
+func (LayerFormatterIPv6) Format(layer gopacket.Layer, _ ...FormatOpt) (string, FormatDelimiter) {
+	ipv6 := layer.(*layers.IPv6)
+	return fmt.Sprintf("%s > %s", ipv6.SrcIP, ipv6.DstIP), FormatDelimiterColon
+}
+
+// ICMP echo request, id 62002, seq 3, length 64
+// ICMP echo reply, id 62002, seq 3, length 64
+// ICMP 172.17.0.2 udp port 10053 unreachable, length 37
+type LayerFormatterICMPv4 struct{}
+
+func (LayerFormatterICMPv4) LayerType() gopacket.LayerType { return layers.LayerTypeICMPv4 }
+
+func (LayerFormatterICMPv4) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	icmp := layer.(*layers.ICMPv4)
+
+	b := strings.Builder{}
+	b.WriteString("ICMP ")
+
+	// TODO: handle code layers.ICMPv4TypeDestinationUnreachable
+	if icmp.TypeCode.Type() == layers.ICMPv4TypeEchoRequest {
+		b.WriteString(fmt.Sprintf("echo request, id %d, seq %d", icmp.Id, icmp.Seq))
+	} else if icmp.TypeCode.Type() == layers.ICMPv4TypeEchoReply {
+		b.WriteString(fmt.Sprintf("echo reply, id %d, seq %d", icmp.Id, icmp.Seq))
+	} else {
+		b.WriteString(icmp.TypeCode.String())
 	}
-	return s
+	b.WriteString(fmt.Sprintf(", length %d", len(icmp.Contents)+len(icmp.Payload)))
+
+	return b.String(), FormatDelimiterNone
+}
+
+// UDP, length 3
+type LayerFormatterUDP struct{}
+
+func (LayerFormatterUDP) LayerType() gopacket.LayerType { return layers.LayerTypeUDP }
+
+func (LayerFormatterUDP) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	udp := layer.(*layers.UDP)
+	if udp.NextLayerType() == gopacket.LayerTypePayload {
+		return fmt.Sprintf("UDP, length %d", len(udp.Payload)), FormatDelimiterNone
+	}
+	return "", FormatDelimiterNone
+}
+
+// VXLAN, flags [I] (0x08), vni 20000
+type LayerFormatterVXLAN struct{}
+
+func (LayerFormatterVXLAN) LayerType() gopacket.LayerType { return layers.LayerTypeVXLAN }
+
+func (LayerFormatterVXLAN) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	vxlan := layer.(*layers.VXLAN)
+
+	var flags []byte
+	if vxlan.ValidIDFlag {
+		flags = append(flags, 'I')
+	}
+	if vxlan.GBPExtension {
+		flags = append(flags, 'G')
+	}
+	if vxlan.GBPDontLearn {
+		flags = append(flags, 'D')
+	}
+	if vxlan.GBPApplied {
+		flags = append(flags, 'A')
+	}
+
+	s := strings.Builder{}
+	s.WriteString("VXLAN")
+	if len(flags) > 0 {
+		s.WriteString(fmt.Sprintf(", flags [%s] (0x08)", flags))
+	}
+	s.WriteString(fmt.Sprintf(", vni %d", vxlan.VNI))
+
+	return s.String(), FormatDelimiterNewline
+}
+
+// Flags [S], seq 1996870669, win 64240, options [mss 1460,sackOK,TS val 2991051445 ecr 0,nop,wscale 7], length 0
+// Flags [S.], seq 1212244906, ack 1996870670, win 65160, options [mss 1460,sackOK,TS val 2190861178 ecr 2991051445,nop,wscale 7], length 0
+// Flags [.], ack 1, win 502, options [nop,nop,TS val 2991051445 ecr 2190861178], length 0
+// Flags [P.], seq 1:79, ack 1, win 510, options [nop,nop,TS val 2190861180 ecr 2991051445], length 78
+// Flags [F.], seq 1, ack 79, win 502, options [nop,nop,TS val 2991052669 ecr 2190861180], length 0
+// Flags [R], seq 3542344698, win 0, length 0
+type LayerFormatterTCP struct{}
+
+func (LayerFormatterTCP) LayerType() gopacket.LayerType { return layers.LayerTypeTCP }
+
+func (f LayerFormatterTCP) Format(layer gopacket.Layer, opts ...FormatOpt) (string, FormatDelimiter) {
+	tcp := layer.(*layers.TCP)
+
+	b := strings.Builder{}
+	b.WriteString(fmt.Sprintf("Flags [%s]", f.formatFlags(tcp)))
+
+	if tcp.SYN {
+		b.WriteString(fmt.Sprintf(", seq %d", tcp.Seq))
+	}
+	if tcp.PSH {
+		b.WriteString(fmt.Sprintf(", seq %d:%d", tcp.Seq, tcp.Seq+uint32(len(tcp.Payload))))
+	}
+	if tcp.FIN {
+		b.WriteString(fmt.Sprintf(", seq %d", tcp.Seq))
+	}
+	if tcp.RST {
+		b.WriteString(fmt.Sprintf(", seq %d", tcp.Seq))
+	}
+	if tcp.ACK {
+		b.WriteString(fmt.Sprintf(", ack %d", tcp.Ack))
+	}
+
+	b.WriteString(fmt.Sprintf(", win %d", tcp.Window))
+	if len(tcp.Options) > 0 {
+		b.WriteString(fmt.Sprintf(", options [%s]", strings.Join(f.formatOptions(tcp.Options), ",")))
+	}
+	b.WriteString(fmt.Sprintf(", length %d", len(tcp.Payload)))
+
+	return b.String(), FormatDelimiterNone
+}
+
+func (LayerFormatterTCP) formatFlags(tcp *layers.TCP) string {
+	flags := []byte{}
+	if tcp.SYN {
+		flags = append(flags, 'S')
+	}
+	if tcp.PSH {
+		flags = append(flags, 'P')
+	}
+	if tcp.FIN {
+		flags = append(flags, 'F')
+	}
+	if tcp.RST {
+		flags = append(flags, 'R')
+	}
+	if tcp.URG {
+		flags = append(flags, 'U')
+	}
+	if tcp.ECE {
+		flags = append(flags, 'E')
+	}
+	if tcp.CWR {
+		flags = append(flags, 'W')
+	}
+	if tcp.ACK {
+		flags = append(flags, '.')
+	}
+	return string(flags)
+}
+
+func (LayerFormatterTCP) formatOptions(options []layers.TCPOption) []string {
+	var result []string
+
+	// TODO: format all tcp option like tcpdump
+	for _, opt := range options {
+		switch opt.OptionType {
+		case layers.TCPOptionKindNop:
+			result = append(result, "nop")
+		case layers.TCPOptionKindMSS:
+			if len(opt.OptionData) >= 2 {
+				result = append(result, fmt.Sprintf("mss %d", binary.BigEndian.Uint16(opt.OptionData)))
+			}
+		case layers.TCPOptionKindSACKPermitted:
+			result = append(result, "sackOK")
+		case layers.TCPOptionKindWindowScale:
+			if len(opt.OptionData) >= 1 {
+				result = append(result, fmt.Sprintf("wscale %d", opt.OptionData[0]))
+			}
+		case layers.TCPOptionKindTimestamps:
+			if len(opt.OptionData) == 8 {
+				result = append(result, fmt.Sprintf("TS val %d ecr %d",
+					binary.BigEndian.Uint32(opt.OptionData[:4]),
+					binary.BigEndian.Uint32(opt.OptionData[4:8])))
+			}
+		default:
+			result = append(result, opt.String())
+		}
+	}
+	return result
+}
+
+func FormatDumpTime(t time.Time) string {
+	return t.Local().Format("15:04:05.000000")
 }
